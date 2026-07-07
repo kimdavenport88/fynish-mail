@@ -37,6 +37,9 @@ MISSING_STATE_VERSION = "missing_state_version"
 DUPLICATE_SPAM_RESCUE_MESSAGE = "duplicate_spam_rescue_message"
 MESSAGE_NOT_FOUND = "message_not_found"
 INVALID_SPAM_RESCUE_ACTION = "invalid_spam_rescue_action"
+GMAIL_RECONNECT_REQUIRED = "gmail_reconnect_required"
+GMAIL_WRITES_DISABLED = "gmail_writes_disabled"
+MESSAGE_ACTION_FAILED = "message_action_failed"
 SPAM_RESCUE_ACTION_LABELS = {
     "restore_to_inbox": {"add": ["INBOX"], "remove": ["SPAM"]},
     "leave_in_spam": {"add": [], "remove": []},
@@ -253,6 +256,125 @@ def _candidate_result(
         "labels_added": labels_added or [],
         "labels_removed": labels_removed or [],
     }
+
+
+def _code_for_gmail_error(error: GmailReadonlySyncError) -> str:
+    message = str(error).lower()
+    if "credential" in message or "token" in message or "reconnect" in message:
+        return GMAIL_RECONNECT_REQUIRED
+    return MESSAGE_ACTION_FAILED
+
+
+def _configured_scopes(account) -> list[str]:
+    try:
+        scopes = json.loads(account["scopes_json"] or "[]")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return []
+    return scopes if isinstance(scopes, list) else []
+
+
+def _has_modify_scope(account) -> bool:
+    return config.GMAIL_MODIFY_SCOPE in _configured_scopes(account)
+
+
+def _token_reference_available(reference: GmailTokenReference) -> bool:
+    return (
+        reference.token_path is not None
+        or reference.provider_connection_id is not None
+        or reference.token_json() is not None
+    )
+
+
+def _execute_live_spam_rescue_restore(
+    *,
+    account,
+    item: SpamRescueCommitAction,
+    labels: Mapping[str, Sequence[str]],
+) -> tuple[dict | None, list[str]]:
+    if account["provider"] != "gmail_readonly" or not (labels["add"] or labels["remove"]):
+        return None, []
+
+    reference = GmailTokenReference.from_row(account)
+    if not _token_reference_available(reference):
+        return (
+            _candidate_result(
+                item,
+                status="blocked",
+                code=GMAIL_RECONNECT_REQUIRED,
+                message="Reconnect this Gmail account before restoring Spam Rescue messages.",
+                labels_added=list(labels["add"]),
+                labels_removed=list(labels["remove"]),
+            ),
+            [],
+        )
+
+    if not _has_modify_scope(account):
+        return (
+            _candidate_result(
+                item,
+                status="blocked",
+                code=GMAIL_RECONNECT_REQUIRED,
+                message="Reconnect this Gmail account with Gmail modify access before restoring this message.",
+                labels_added=list(labels["add"]),
+                labels_removed=list(labels["remove"]),
+            ),
+            [],
+        )
+
+    if not config.ENABLE_GMAIL_WRITES:
+        return (
+            _candidate_result(
+                item,
+                status="blocked",
+                code=GMAIL_WRITES_DISABLED,
+                message="Live Gmail writes are disabled, so this message was left in Spam Rescue.",
+                labels_added=list(labels["add"]),
+                labels_removed=list(labels["remove"]),
+            ),
+            [],
+        )
+
+    adapter = get_mail_provider_adapter(account["provider"])
+    if adapter is None:
+        return (
+            _candidate_result(
+                item,
+                status="blocked",
+                code=MESSAGE_ACTION_FAILED,
+                message="No Gmail provider adapter is available for this account.",
+                labels_added=list(labels["add"]),
+                labels_removed=list(labels["remove"]),
+            ),
+            [],
+        )
+
+    try:
+        response_label_ids = adapter.modify_message_labels(
+            token_reference=reference,
+            provider_message_id=item.gmail_message_id,
+            labels_to_add=list(labels["add"]),
+            labels_to_remove=list(labels["remove"]),
+        )
+    except GmailReadonlySyncError as error:
+        logger.warning(
+            "Spam Rescue Gmail restore failed for account=%s message_id=%s: %s",
+            item.account_email,
+            item.gmail_message_id,
+            error,
+        )
+        return (
+            _candidate_result(
+                item,
+                status="failed",
+                code=_code_for_gmail_error(error),
+                message=str(error) or "Gmail restore failed.",
+                labels_added=list(labels["add"]),
+                labels_removed=list(labels["remove"]),
+            ),
+            [],
+        )
+
+    return None, list(response_label_ids)
 
 
 def _request_hash(actions: Sequence[SpamRescueCommitAction]) -> str:
@@ -804,6 +926,18 @@ def commit_spam_rescue_actions(
                 continue
 
             labels = SPAM_RESCUE_ACTION_LABELS[item.action]
+            live_failure, response_label_ids = _execute_live_spam_rescue_restore(
+                account=account,
+                item=item,
+                labels=labels,
+            )
+            if live_failure is not None:
+                results.append(live_failure)
+                continue
+
+            if response_label_ids:
+                message = {**message, "gmail_labels": response_label_ids}
+
             now = _now_iso()
             message_row = _upsert_spam_rescue_message(
                 conn,
