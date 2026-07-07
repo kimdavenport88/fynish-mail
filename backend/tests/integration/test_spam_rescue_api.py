@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from app.db.database import get_connection
 from app.db.foundation_migration import DEFAULT_LOCAL_OWNER_EMAIL
+from app.services.gmail_readonly import GmailReadonlySyncError
 
 
 def _candidate_by_gmail_id(payload: dict, gmail_message_id: str) -> dict:
@@ -16,8 +17,13 @@ def _candidate_by_gmail_id(payload: dict, gmail_message_id: str) -> dict:
     )
 
 
-def _seed_gmail_account_for_local_owner(email: str = "owner@example.com") -> None:
+def _seed_gmail_account_for_local_owner(
+    email: str = "owner@example.com",
+    *,
+    scopes: list[str] | None = None,
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    scopes = scopes or ["gmail.readonly"]
     with get_connection() as conn:
         user = conn.execute(
             """
@@ -47,7 +53,7 @@ def _seed_gmail_account_for_local_owner(email: str = "owner@example.com") -> Non
             (
                 cursor.lastrowid,
                 "/tmp/fake-token.json",
-                json.dumps(["gmail.readonly"]),
+                json.dumps(scopes),
                 now,
                 now,
             ),
@@ -77,9 +83,11 @@ def _gmail_spam_message(**overrides) -> dict:
 class _FakeSpamAdapter:
     provider_name = "gmail_readonly"
 
-    def __init__(self, messages):
+    def __init__(self, messages, *, modify_error: Exception | None = None):
         self.messages = messages
         self.calls = []
+        self.modify_calls = []
+        self.modify_error = modify_error
 
     def list_unread_inbox_messages(self, token_reference, max_results):
         return []
@@ -93,8 +101,24 @@ class _FakeSpamAdapter:
         )
         return self.messages
 
-    def modify_message_labels(self, **_):
-        return []
+    def modify_message_labels(
+        self,
+        *,
+        token_reference,
+        provider_message_id,
+        labels_to_add,
+        labels_to_remove,
+    ):
+        self.modify_calls.append(
+            {
+                "provider_message_id": provider_message_id,
+                "labels_to_add": labels_to_add,
+                "labels_to_remove": labels_to_remove,
+            }
+        )
+        if self.modify_error is not None:
+            raise self.modify_error
+        return ["INBOX", "UNREAD"]
 
     def requires_modify_scope(self):
         return None
@@ -310,6 +334,239 @@ def test_spam_rescue_leave_in_spam_commits_without_label_mutation(api_client, se
     assert row["selected_action"] == "leave_in_spam"
     assert row["gmail_labels_added_json"] == "[]"
     assert row["gmail_labels_removed_json"] == "[]"
+
+
+def test_spam_rescue_restore_to_inbox_modifies_gmail_before_logging(
+    api_client,
+    isolated_db,
+    monkeypatch,
+):
+    api_client.get("/api/features")
+    _seed_gmail_account_for_local_owner(
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    )
+    adapter = _FakeSpamAdapter([_gmail_spam_message()])
+    monkeypatch.setattr("app.core.config.ENABLE_GMAIL_WRITES", True)
+    monkeypatch.setattr("app.services.spam_rescue.get_mail_provider_adapter", lambda _: adapter)
+
+    sync_response = api_client.post("/api/spam-rescue/sync")
+    assert sync_response.status_code == 200
+    candidate = _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+
+    response = api_client.post(
+        "/api/spam-rescue/staged-actions/commit",
+        json={
+            "idempotency_key": "live-restore-1",
+            "actions": [
+                {
+                    "client_action_id": "client-live-restore-1",
+                    "account_email": candidate["account_email"],
+                    "gmail_message_id": candidate["gmail_message_id"],
+                    "action": "restore_to_inbox",
+                    "expected_version": candidate["state_version"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["committed_count"] == 1
+    assert payload["failed_count"] == 0
+    assert adapter.modify_calls == [
+        {
+            "provider_message_id": "real-spam-1001",
+            "labels_to_add": ["INBOX"],
+            "labels_to_remove": ["SPAM"],
+        }
+    ]
+
+    with get_connection() as conn:
+        message_row = conn.execute(
+            """
+            SELECT reviewed, provider_labels_json
+            FROM messages
+            WHERE provider_message_id = 'real-spam-1001'
+            """
+        ).fetchone()
+        action_rows = conn.execute(
+            """
+            SELECT selected_action, gmail_labels_added_json, gmail_labels_removed_json
+            FROM actions_log
+            WHERE gmail_message_id = 'real-spam-1001'
+            """
+        ).fetchall()
+
+    assert message_row["reviewed"] == 1
+    assert json.loads(message_row["provider_labels_json"]) == ["INBOX", "UNREAD"]
+    assert [dict(row) for row in action_rows] == [
+        {
+            "selected_action": "restore_to_inbox",
+            "gmail_labels_added_json": '["INBOX"]',
+            "gmail_labels_removed_json": '["SPAM"]',
+        }
+    ]
+
+
+def test_spam_rescue_restore_blocks_without_modify_scope_and_keeps_candidate(
+    api_client,
+    isolated_db,
+    monkeypatch,
+):
+    api_client.get("/api/features")
+    _seed_gmail_account_for_local_owner(scopes=["gmail.readonly"])
+    adapter = _FakeSpamAdapter([_gmail_spam_message()])
+    monkeypatch.setattr("app.core.config.ENABLE_GMAIL_WRITES", True)
+    monkeypatch.setattr("app.services.spam_rescue.get_mail_provider_adapter", lambda _: adapter)
+
+    assert api_client.post("/api/spam-rescue/sync").status_code == 200
+    candidate = _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+
+    response = api_client.post(
+        "/api/spam-rescue/staged-actions/commit",
+        json={
+            "idempotency_key": "live-restore-missing-scope-1",
+            "actions": [
+                {
+                    "client_action_id": "client-live-restore-missing-scope-1",
+                    "account_email": candidate["account_email"],
+                    "gmail_message_id": candidate["gmail_message_id"],
+                    "action": "restore_to_inbox",
+                    "expected_version": candidate["state_version"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["committed_count"] == 0
+    assert payload["failed_count"] == 1
+    assert payload["results"][0]["status"] == "blocked"
+    assert payload["results"][0]["code"] == "gmail_reconnect_required"
+    assert adapter.modify_calls == []
+
+    with get_connection() as conn:
+        message_row = conn.execute(
+            """
+            SELECT reviewed
+            FROM messages
+            WHERE provider_message_id = 'real-spam-1001'
+            """
+        ).fetchone()
+        action_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM actions_log
+            WHERE gmail_message_id = 'real-spam-1001'
+            """
+        ).fetchone()["count"]
+
+    assert message_row["reviewed"] == 0
+    assert action_count == 0
+    assert _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+
+
+def test_spam_rescue_restore_gmail_failure_keeps_candidate_without_log(
+    api_client,
+    isolated_db,
+    monkeypatch,
+):
+    api_client.get("/api/features")
+    _seed_gmail_account_for_local_owner(
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    )
+    adapter = _FakeSpamAdapter(
+        [_gmail_spam_message()],
+        modify_error=GmailReadonlySyncError("Gmail modify operation failed: reconnect required"),
+    )
+    monkeypatch.setattr("app.core.config.ENABLE_GMAIL_WRITES", True)
+    monkeypatch.setattr("app.services.spam_rescue.get_mail_provider_adapter", lambda _: adapter)
+
+    assert api_client.post("/api/spam-rescue/sync").status_code == 200
+    candidate = _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+
+    response = api_client.post(
+        "/api/spam-rescue/staged-actions/commit",
+        json={
+            "idempotency_key": "live-restore-failure-1",
+            "actions": [
+                {
+                    "client_action_id": "client-live-restore-failure-1",
+                    "account_email": candidate["account_email"],
+                    "gmail_message_id": candidate["gmail_message_id"],
+                    "action": "restore_to_inbox",
+                    "expected_version": candidate["state_version"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["committed_count"] == 0
+    assert payload["failed_count"] == 1
+    assert payload["results"][0]["status"] == "failed"
+    assert payload["results"][0]["code"] == "gmail_reconnect_required"
+    assert len(adapter.modify_calls) == 1
+
+    with get_connection() as conn:
+        message_row = conn.execute(
+            """
+            SELECT reviewed
+            FROM messages
+            WHERE provider_message_id = 'real-spam-1001'
+            """
+        ).fetchone()
+        action_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM actions_log
+            WHERE gmail_message_id = 'real-spam-1001'
+            """
+        ).fetchone()["count"]
+
+    assert message_row["reviewed"] == 0
+    assert action_count == 0
+    assert _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+
+
+def test_spam_rescue_idempotent_replay_does_not_repeat_gmail_restore(
+    api_client,
+    isolated_db,
+    monkeypatch,
+):
+    api_client.get("/api/features")
+    _seed_gmail_account_for_local_owner(
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    )
+    adapter = _FakeSpamAdapter([_gmail_spam_message()])
+    monkeypatch.setattr("app.core.config.ENABLE_GMAIL_WRITES", True)
+    monkeypatch.setattr("app.services.spam_rescue.get_mail_provider_adapter", lambda _: adapter)
+
+    assert api_client.post("/api/spam-rescue/sync").status_code == 200
+    candidate = _candidate_by_gmail_id(api_client.get("/api/spam-rescue").json(), "real-spam-1001")
+    payload = {
+        "idempotency_key": "live-restore-idempotent-1",
+        "actions": [
+            {
+                "client_action_id": "client-live-restore-idempotent-1",
+                "account_email": candidate["account_email"],
+                "gmail_message_id": candidate["gmail_message_id"],
+                "action": "restore_to_inbox",
+                "expected_version": candidate["state_version"],
+            }
+        ],
+    }
+
+    first_response = api_client.post("/api/spam-rescue/staged-actions/commit", json=payload)
+    second_response = api_client.post("/api/spam-rescue/staged-actions/commit", json=payload)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["committed_count"] == 1
+    assert second_response.json()["idempotent_replay"] is True
+    assert len(adapter.modify_calls) == 1
 
 
 def test_spam_rescue_commit_rejects_stale_state_version(api_client, seeded_db):
