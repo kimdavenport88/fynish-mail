@@ -622,6 +622,16 @@
   color: var(--blue-deep);
 }
 
+.processed-action-restore_to_inbox {
+  background: rgba(72, 150, 129, 0.16);
+  color: #276f61;
+}
+
+.processed-action-leave_in_spam {
+  background: rgba(116, 102, 90, 0.16);
+  color: #655443;
+}
+
 .processed-account,
 .processed-source,
 .processed-time {
@@ -704,6 +714,28 @@
 .processed-expanded-review {
   border-color: rgba(90, 113, 188, 0.2);
   background: rgba(245, 248, 255, 0.84);
+}
+
+.processed-row-restore {
+  background:
+    linear-gradient(180deg, rgba(240, 251, 248, 0.9) 0%, rgba(250, 255, 253, 0.86) 100%);
+}
+
+.processed-row-restore.expanded,
+.processed-expanded-restore {
+  border-color: rgba(72, 150, 129, 0.24);
+  background: rgba(240, 251, 248, 0.86);
+}
+
+.processed-row-left-spam {
+  background:
+    linear-gradient(180deg, rgba(248, 245, 241, 0.92) 0%, rgba(253, 251, 248, 0.88) 100%);
+}
+
+.processed-row-left-spam.expanded,
+.processed-expanded-left-spam {
+  border-color: rgba(116, 102, 90, 0.22);
+  background: rgba(248, 245, 241, 0.88);
 }
 
 .processed-expanded strong {

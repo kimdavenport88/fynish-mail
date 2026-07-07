@@ -15,6 +15,33 @@ ANGLE_WRAPPED_URL_RE = re.compile(r"<https?://[^>\s]+>", re.IGNORECASE)
 URL_ONLY_LINE_RE = re.compile(r"^\s*(?:https?://|www\.)\S+\s*$", re.IGNORECASE)
 PROCESSED_PREVIEW_LIMIT = 4000
 AUTO_CLEAN_PRIORITY_WINDOW = timedelta(days=2)
+PROCESSED_ACTION_LABELS = {
+    "trash": "Trash Msg",
+    "junk_review": "Junk Rule",
+    "bulk_mail": "Bulk Rule",
+    "needs_review": "Needs Review",
+    "keep": "Keep Msg",
+    "restore_to_inbox": "Rescued from Spam",
+    "leave_in_spam": "Left in Spam",
+}
+ACTION_SOURCE_LABELS = {
+    "manual": "Manual",
+    "rule_auto_apply": "Rule auto",
+    "high_confidence_auto_clean": "Auto-clean",
+    "recovery": "Recovery",
+    "spam_rescue": "Spam Rescue",
+    "legacy_unknown": "Legacy",
+}
+
+
+def _format_action_source(source: str | None) -> str:
+    normalized = source or "manual"
+    return ACTION_SOURCE_LABELS.get(normalized, normalized.replace("_", " "))
+
+
+def _format_processed_action(action: str | None) -> str:
+    normalized = action or ""
+    return PROCESSED_ACTION_LABELS.get(normalized, normalized.replace("_", " "))
 
 
 def _normalize_preview(
@@ -134,9 +161,11 @@ def list_processed_messages(limit: int = 200, user_id: int | None = None) -> lis
                 "subject": subject,
                 "preview": _normalize_preview(message.snippet, message.body_preview),
                 "selected_action": row["selected_action"],
+                "selected_action_label": _format_processed_action(row["selected_action"]),
                 "recommended_action": row["recommended_action"],
                 "user_overrode": bool(row["user_overrode"]),
                 "action_source": row["action_source"] or "manual",
+                "action_source_label": _format_action_source(row["action_source"]),
                 "created_rule_id": row["created_rule_id"],
                 "received_at": message.received_at,
             }

@@ -134,10 +134,12 @@ class ProcessedMessageOut(BaseModel):
     sender_domain: str
     subject: str
     preview: str
-    selected_action: Category
-    recommended_action: Category
+    selected_action: Category | SpamRescueAction
+    selected_action_label: str
+    recommended_action: Category | Literal["spam_rescue"]
     user_overrode: bool
     action_source: str
+    action_source_label: str
     created_rule_id: int | None
     received_at: str | None
 

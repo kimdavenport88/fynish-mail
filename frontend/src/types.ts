@@ -282,9 +282,11 @@ export interface ProcessedMessage {
   subject: string
   preview: string
   selected_action: ProcessedAction
+  selected_action_label: string
   recommended_action: Category | 'spam_rescue'
   user_overrode: boolean
   action_source: string
+  action_source_label: string
   created_rule_id: number | null
   received_at: string | null
 }
