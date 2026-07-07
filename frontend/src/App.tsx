@@ -135,7 +135,7 @@ const PROCESSED_ACTION_LABELS: Record<string, string> = {
   bulk_mail: 'Bulk Rule',
   needs_review: 'Needs Review',
   keep: 'Keep Msg',
-  restore_to_inbox: 'Restored',
+  restore_to_inbox: 'Rescued from Spam',
   leave_in_spam: 'Left in Spam',
 }
 
@@ -273,6 +273,17 @@ function queueCategoryClassName(category: string) {
       return 'review'
     default:
       return category
+  }
+}
+
+function processedActionClassName(action: string) {
+  switch (action) {
+    case 'restore_to_inbox':
+      return 'restore'
+    case 'leave_in_spam':
+      return 'left-spam'
+    default:
+      return queueCategoryClassName(action)
   }
 }
 
@@ -2266,7 +2277,7 @@ function App() {
       ) : (
         <div className="processed-list" role="list" aria-label="Processed mail list">
           {visibleProcessedMessages.map((message) => {
-            const processedClass = queueCategoryClassName(message.selected_action)
+            const processedClass = processedActionClassName(message.selected_action)
 
             return (
             <div key={message.id} className="processed-item" role="listitem">
@@ -2279,10 +2290,15 @@ function App() {
                 }
               >
                 <span className={`processed-action processed-action-${message.selected_action}`}>
-                  {PROCESSED_ACTION_LABELS[message.selected_action] ?? formatActionSource(message.selected_action)}
+                  {message.selected_action_label ||
+                    PROCESSED_ACTION_LABELS[message.selected_action] ||
+                    formatActionSource(message.selected_action)}
                 </span>
-                <span className="processed-source" title={`Source: ${formatActionSource(message.action_source)}`}>
-                  {formatActionSource(message.action_source)}
+                <span
+                  className="processed-source"
+                  title={`Source: ${message.action_source_label || formatActionSource(message.action_source)}`}
+                >
+                  {message.action_source_label || formatActionSource(message.action_source)}
                 </span>
                 <span className="processed-account" title={message.account_email}>
                   {message.account_email}
@@ -2300,7 +2316,9 @@ function App() {
               {expandedProcessedId === message.id ? (
                 <div className={`processed-expanded processed-expanded-${processedClass}`}>
                   <strong>Preview</strong>
-                  <p className="message-meta">Source: {formatActionSource(message.action_source)}</p>
+                  <p className="message-meta">
+                    Source: {message.action_source_label || formatActionSource(message.action_source)}
+                  </p>
                   <p className="message-meta">From: {message.sender_email || message.sender}</p>
                   <div className="processed-preview-scroll">
                     {message.preview || 'No preview available.'}

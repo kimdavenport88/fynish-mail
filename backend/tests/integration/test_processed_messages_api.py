@@ -6,6 +6,15 @@ from app.db.database import get_connection
 from app.services.review_queue import apply_message_action, sync_unread_messages
 
 
+def _candidate_by_gmail_id(payload: dict, gmail_message_id: str) -> dict:
+    return next(
+        message
+        for account in payload["accounts"]
+        for message in account["messages"]
+        if message["gmail_message_id"] == gmail_message_id
+    )
+
+
 def test_processed_messages_prioritizes_recent_auto_cleaned_then_recent(api_client, isolated_db):
     sync_unread_messages()
 
@@ -155,3 +164,73 @@ def test_processed_messages_decodes_html_entities_and_hides_tracking_urls(api_cl
     assert "FIFA World Cup 2026 kicks off on FOX One" in preview
     assert "https://c.gle" not in preview
     assert "https://example.com" not in preview
+
+
+def test_processed_messages_labels_spam_rescue_restore(api_client, seeded_db):
+    queue = api_client.get("/api/spam-rescue").json()
+    candidate = _candidate_by_gmail_id(queue, "ps-9001")
+
+    response = api_client.post(
+        "/api/spam-rescue/staged-actions/commit",
+        json={
+            "idempotency_key": "processed-spam-rescue-restore-1",
+            "actions": [
+                {
+                    "client_action_id": "client-processed-spam-rescue-restore-1",
+                    "account_email": candidate["account_email"],
+                    "gmail_message_id": candidate["gmail_message_id"],
+                    "action": "restore_to_inbox",
+                    "expected_version": candidate["state_version"],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+
+    processed_response = api_client.get("/api/messages/processed")
+    assert processed_response.status_code == 200
+    message = next(
+        item
+        for item in processed_response.json()["messages"]
+        if item["selected_action"] == "restore_to_inbox"
+    )
+
+    assert message["recommended_action"] == "spam_rescue"
+    assert message["selected_action_label"] == "Rescued from Spam"
+    assert message["action_source"] == "spam_rescue"
+    assert message["action_source_label"] == "Spam Rescue"
+
+
+def test_processed_messages_labels_spam_rescue_leave_in_spam(api_client, seeded_db):
+    queue = api_client.get("/api/spam-rescue").json()
+    candidate = _candidate_by_gmail_id(queue, "ps-9004")
+
+    response = api_client.post(
+        "/api/spam-rescue/staged-actions/commit",
+        json={
+            "idempotency_key": "processed-spam-rescue-leave-1",
+            "actions": [
+                {
+                    "client_action_id": "client-processed-spam-rescue-leave-1",
+                    "account_email": candidate["account_email"],
+                    "gmail_message_id": candidate["gmail_message_id"],
+                    "action": "leave_in_spam",
+                    "expected_version": candidate["state_version"],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+
+    processed_response = api_client.get("/api/messages/processed")
+    assert processed_response.status_code == 200
+    message = next(
+        item
+        for item in processed_response.json()["messages"]
+        if item["selected_action"] == "leave_in_spam"
+    )
+
+    assert message["recommended_action"] == "spam_rescue"
+    assert message["selected_action_label"] == "Left in Spam"
+    assert message["action_source"] == "spam_rescue"
+    assert message["action_source_label"] == "Spam Rescue"
